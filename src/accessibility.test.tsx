@@ -9,7 +9,7 @@ describe("accessibility (axe-core)", () => {
     vi.stubGlobal("fetch", vi.fn());
     const { container } = render(<App />);
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toHaveLength(0);
   });
 
   it("has no detectable a11y violations in the flashcard results", async () => {
@@ -22,6 +22,6 @@ describe("accessibility (axe-core)", () => {
       />
     );
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toHaveLength(0);
   });
 });
