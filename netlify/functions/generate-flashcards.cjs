@@ -1,13 +1,5 @@
 /* netlify/functions/generate-flashcards.cjs */
 
-/*
-  Takes raw study notes and returns structured flashcards via the Claude API.
-
-  This is the one place in the app that talks to the model.
-  Validation, prompt construction, response validation, and error
-  handling all happen here.
-*/
-
 const MAX_NOTES_LENGTH = 8000;
 const MIN_NOTES_LENGTH = 20;
 
@@ -45,16 +37,16 @@ exports.handler = async (event) => {
     });
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
     return respond(500, {
       error:
-        "Server is missing ANTHROPIC_API_KEY. Set it in Netlify env vars.",
+        "Server is missing GEMINI_API_KEY. Set it in Netlify environment variables.",
     });
   }
 
-  const systemPrompt = `
+  const prompt = `
 You are a study assistant that converts study notes into useful flashcards.
 
 Create 5 to 8 flashcards that test understanding of the important concepts.
@@ -63,53 +55,82 @@ Rules:
 - Focus on concepts and understanding, not exact sentence recall.
 - Each flashcard must have one clear question and one clear answer.
 - Keep questions and answers concise.
-- Return ONLY valid JSON.
-- Do not use markdown.
-- Do not include any explanation outside the JSON.
+- Use only information supported by the supplied notes.
+- Return only the requested JSON structure.
 
-Return exactly this structure:
+Study notes:
 
-{
-  "flashcards": [
-    {
-      "question": "string",
-      "answer": "string"
-    }
-  ]
-}
+${notes}
 `;
 
-  let anthropicRes;
+  let geminiRes;
 
   try {
-    anthropicRes = await fetch(
-      "https://api.anthropic.com/v1/messages",
+    geminiRes = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent",
       {
         method: "POST",
 
         headers: {
-          "content-type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
         },
 
         body: JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 1200,
-
-          system: systemPrompt,
-
-          messages: [
+          contents: [
             {
-              role: "user",
-              content: notes,
+              parts: [
+                {
+                  text: prompt,
+                },
+              ],
             },
           ],
+
+          generationConfig: {
+            responseMimeType: "application/json",
+
+            responseSchema: {
+              type: "object",
+
+              properties: {
+                flashcards: {
+                  type: "array",
+
+                  items: {
+                    type: "object",
+
+                    properties: {
+                      question: {
+                        type: "string",
+                      },
+
+                      answer: {
+                        type: "string",
+                      },
+                    },
+
+                    required: [
+                      "question",
+                      "answer",
+                    ],
+                  },
+                },
+              },
+
+              required: [
+                "flashcards",
+              ],
+            },
+          },
         }),
       }
     );
   } catch (error) {
-    console.error("Anthropic connection error:", error);
+    console.error(
+      "Gemini connection error:",
+      error
+    );
 
     return respond(502, {
       error:
@@ -117,13 +138,13 @@ Return exactly this structure:
     });
   }
 
-  if (!anthropicRes.ok) {
-    const status = anthropicRes.status;
+  if (!geminiRes.ok) {
+    const status = geminiRes.status;
 
     let providerMessage = "";
 
     try {
-      const errorData = await anthropicRes.json();
+      const errorData = await geminiRes.json();
 
       providerMessage =
         errorData?.error?.message || "";
@@ -132,52 +153,58 @@ Return exactly this structure:
     }
 
     console.error(
-      "Anthropic API error:",
+      "Gemini API error:",
       status,
       providerMessage
     );
 
-    if (status === 401) {
+    if (status === 400) {
+      return respond(502, {
+        error: providerMessage
+          ? `Gemini rejected the request: ${providerMessage}`
+          : "Gemini rejected the request.",
+      });
+    }
+
+    if (status === 401 || status === 403) {
       return respond(502, {
         error:
-          "The AI service rejected the API key. Check the ANTHROPIC_API_KEY in Netlify.",
+          "The Gemini API key was rejected. Check GEMINI_API_KEY in Netlify.",
       });
     }
 
     if (status === 429) {
       return respond(429, {
         error:
-          "Rate limited — wait a moment and retry.",
+          "Gemini rate limit reached — wait a moment and retry.",
       });
     }
 
     return respond(502, {
       error: providerMessage
-        ? `AI provider error: ${providerMessage}`
-        : `AI provider returned an error (${status}).`,
+        ? `Gemini API error: ${providerMessage}`
+        : `Gemini returned an error (${status}).`,
     });
   }
 
   let data;
 
   try {
-    data = await anthropicRes.json();
+    data = await geminiRes.json();
   } catch {
     return respond(502, {
       error:
-        "AI provider returned an unreadable response.",
+        "Gemini returned an unreadable response.",
     });
   }
 
   const rawText =
-    data?.content?.find(
-      (block) => block.type === "text"
-    )?.text || "";
+    data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
   if (!rawText) {
     return respond(502, {
       error:
-        "The AI returned an empty response. Please try again.",
+        "Gemini returned an empty response. Please try again.",
     });
   }
 
@@ -187,13 +214,13 @@ Return exactly this structure:
     parsed = JSON.parse(rawText);
   } catch (error) {
     console.error(
-      "Invalid JSON from Claude:",
+      "Invalid JSON from Gemini:",
       rawText
     );
 
     return respond(502, {
       error:
-        "The AI's response wasn't in the expected format. Please try again.",
+        "Gemini's response wasn't in the expected format. Please try again.",
     });
   }
 
@@ -203,7 +230,7 @@ Return exactly this structure:
   ) {
     return respond(502, {
       error:
-        "The AI didn't return any flashcards. Please try again.",
+        "Gemini didn't return any flashcards. Please try again.",
     });
   }
 
@@ -224,7 +251,7 @@ Return exactly this structure:
   if (flashcards.length === 0) {
     return respond(502, {
       error:
-        "The AI's flashcards were malformed. Please try again.",
+        "Gemini's flashcards were malformed. Please try again.",
     });
   }
 
