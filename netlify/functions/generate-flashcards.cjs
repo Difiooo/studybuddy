@@ -1,33 +1,44 @@
-// netlify/functions/generate-flashcards.js
-//
-// Takes raw study notes and returns structured flashcards via the Claude API.
-// This is the one place in the app that talks to the model — everything
-// upstream (validation, prompt construction) and downstream (response
-// validation, error shaping) lives here so the frontend never has to trust
-// the model's output blindly.
+/* netlify/functions/generate-flashcards.cjs */
+
+/*
+  Takes raw study notes and returns structured flashcards via the Claude API.
+
+  This is the one place in the app that talks to the model.
+  Validation, prompt construction, response validation, and error
+  handling all happen here.
+*/
 
 const MAX_NOTES_LENGTH = 8000;
 const MIN_NOTES_LENGTH = 20;
 
 exports.handler = async (event) => {
   if (event.httpMethod !== "POST") {
-    return respond(405, { error: "Method not allowed" });
+    return respond(405, {
+      error: "Method not allowed",
+    });
   }
 
   let body;
+
   try {
     body = JSON.parse(event.body || "{}");
   } catch {
-    return respond(400, { error: "Malformed request body." });
+    return respond(400, {
+      error: "Malformed request body.",
+    });
   }
 
-  const notes = typeof body.notes === "string" ? body.notes.trim() : "";
+  const notes =
+    typeof body.notes === "string"
+      ? body.notes.trim()
+      : "";
 
   if (notes.length < MIN_NOTES_LENGTH) {
     return respond(400, {
       error: `Notes are too short — paste at least ${MIN_NOTES_LENGTH} characters so there's something to work with.`,
     });
   }
+
   if (notes.length > MAX_NOTES_LENGTH) {
     return respond(400, {
       error: `Notes are too long (max ${MAX_NOTES_LENGTH} characters). Try a shorter excerpt.`,
@@ -35,102 +46,201 @@ exports.handler = async (event) => {
   }
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
+
   if (!apiKey) {
-    // Fails safely and explains itself instead of a bare 500 — a future dev
-    // (or you, in six months) sees exactly what's missing.
     return respond(500, {
-      error: "Server is missing ANTHROPIC_API_KEY. Set it in Netlify env vars.",
+      error:
+        "Server is missing ANTHROPIC_API_KEY. Set it in Netlify env vars.",
     });
   }
 
-  const systemPrompt = `You turn study notes into flashcards. Read the notes and produce
-5 to 8 flashcards that test understanding of the key concepts (not just
-recall of exact phrases). Return ONLY valid JSON, no prose, no markdown
-fences, matching exactly this shape:
-{"flashcards": [{"question": "string", "answer": "string"}, ...]}`;
+  const systemPrompt = `
+You are a study assistant that converts study notes into useful flashcards.
+
+Create 5 to 8 flashcards that test understanding of the important concepts.
+
+Rules:
+- Focus on concepts and understanding, not exact sentence recall.
+- Each flashcard must have one clear question and one clear answer.
+- Keep questions and answers concise.
+- Return ONLY valid JSON.
+- Do not use markdown.
+- Do not include any explanation outside the JSON.
+
+Return exactly this structure:
+
+{
+  "flashcards": [
+    {
+      "question": "string",
+      "answer": "string"
+    }
+  ]
+}
+`;
 
   let anthropicRes;
+
   try {
-    anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 1200,
-        system: systemPrompt,
-        messages: [{ role: "user", content: notes }],
-      }),
-    });
-  } catch {
+    anthropicRes = await fetch(
+      "https://api.anthropic.com/v1/messages",
+      {
+        method: "POST",
+
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1200,
+
+          system: systemPrompt,
+
+          messages: [
+            {
+              role: "user",
+              content: notes,
+            },
+          ],
+        }),
+      }
+    );
+  } catch (error) {
+    console.error("Anthropic connection error:", error);
+
     return respond(502, {
-      error: "Couldn't reach the AI provider. Please try again in a moment.",
+      error:
+        "Couldn't reach the AI provider. Please try again in a moment.",
     });
   }
 
   if (!anthropicRes.ok) {
     const status = anthropicRes.status;
-    // Distinguish rate limiting from other failures so the frontend can
-    // show a more useful message than a generic error.
-    if (status === 429) {
-      return respond(429, { error: "Rate limited — wait a moment and retry." });
+
+    let providerMessage = "";
+
+    try {
+      const errorData = await anthropicRes.json();
+
+      providerMessage =
+        errorData?.error?.message || "";
+    } catch {
+      providerMessage = "";
     }
-    return respond(502, { error: `AI provider returned an error (${status}).` });
-  }
 
-  let data;
-  try {
-    data = await anthropicRes.json();
-  } catch {
-    return respond(502, { error: "AI provider returned an unreadable response." });
-  }
+    console.error(
+      "Anthropic API error:",
+      status,
+      providerMessage
+    );
 
-  const rawText = data?.content?.find((b) => b.type === "text")?.text ?? "";
+    if (status === 401) {
+      return respond(502, {
+        error:
+          "The AI service rejected the API key. Check the ANTHROPIC_API_KEY in Netlify.",
+      });
+    }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
-    // The model didn't follow the structured-output contract. Fail safely
-    // rather than showing garbage or a raw JSON parse error to the user.
+    if (status === 429) {
+      return respond(429, {
+        error:
+          "Rate limited — wait a moment and retry.",
+      });
+    }
+
     return respond(502, {
-      error: "The AI's response wasn't in the expected format. Please try again.",
+      error: providerMessage
+        ? `AI provider error: ${providerMessage}`
+        : `AI provider returned an error (${status}).`,
     });
   }
 
-  if (!Array.isArray(parsed?.flashcards) || parsed.flashcards.length === 0) {
+  let data;
+
+  try {
+    data = await anthropicRes.json();
+  } catch {
     return respond(502, {
-      error: "The AI didn't return any flashcards. Please try again.",
+      error:
+        "AI provider returned an unreadable response.",
+    });
+  }
+
+  const rawText =
+    data?.content?.find(
+      (block) => block.type === "text"
+    )?.text || "";
+
+  if (!rawText) {
+    return respond(502, {
+      error:
+        "The AI returned an empty response. Please try again.",
+    });
+  }
+
+  let parsed;
+
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (error) {
+    console.error(
+      "Invalid JSON from Claude:",
+      rawText
+    );
+
+    return respond(502, {
+      error:
+        "The AI's response wasn't in the expected format. Please try again.",
+    });
+  }
+
+  if (
+    !Array.isArray(parsed?.flashcards) ||
+    parsed.flashcards.length === 0
+  ) {
+    return respond(502, {
+      error:
+        "The AI didn't return any flashcards. Please try again.",
     });
   }
 
   const flashcards = parsed.flashcards
     .filter(
-      (c) =>
-        c &&
-        typeof c.question === "string" &&
-        typeof c.answer === "string" &&
-        c.question.trim() &&
-        c.answer.trim()
+      (card) =>
+        card &&
+        typeof card.question === "string" &&
+        typeof card.answer === "string" &&
+        card.question.trim() &&
+        card.answer.trim()
     )
-    .map((c) => ({ question: c.question.trim(), answer: c.answer.trim() }));
+    .map((card) => ({
+      question: card.question.trim(),
+      answer: card.answer.trim(),
+    }));
 
   if (flashcards.length === 0) {
     return respond(502, {
-      error: "The AI's flashcards were malformed. Please try again.",
+      error:
+        "The AI's flashcards were malformed. Please try again.",
     });
   }
 
-  return respond(200, { flashcards });
+  return respond(200, {
+    flashcards,
+  });
 };
 
 function respond(statusCode, bodyObj) {
   return {
     statusCode,
-    headers: { "content-type": "application/json" },
+
+    headers: {
+      "content-type": "application/json",
+    },
+
     body: JSON.stringify(bodyObj),
   };
 }
